@@ -82,7 +82,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
     // ── LOGOUT ───────────────────────────────────────────────
     if ($action === 'logout') {
-        $keep = [];
         session_destroy();
         session_start();
         header('Location: ' . $_SERVER['PHP_SELF'] . '?page=login&msg=logged_out');
@@ -877,7 +876,12 @@ $currentPage   = max(1, (int)($_GET['p'] ?? 1));
 switch ($page) {
     case 'repos':
         // Fetch ALL repos, no pagination — show everything at once
-        $allRepos = $api->fetchAllRepos($currentSort, $currentSearch);
+        // 'alpha' is not a valid Gitea API sort — fetch by 'updated' then sort PHP-side
+        $apiSort  = ($currentSort === 'alpha') ? 'updated' : $currentSort;
+        $allRepos = $api->fetchAllRepos($apiSort, $currentSearch);
+        if ($currentSort === 'alpha') {
+            usort($allRepos, fn($a, $b) => strcasecmp($a['full_name'] ?? '', $b['full_name'] ?? ''));
+        }
         $pageData['all_repos']   = $allRepos;
         $pageData['repos']       = $allRepos;   // pass full list to template
         $pageData['total_repos'] = count($allRepos);
@@ -886,7 +890,12 @@ switch ($page) {
 
     case 'dashboard':
         // Fetch ALL repos across all pages (handles 3+ pages of 50 each)
-        $allRepos = $api->fetchAllRepos($currentSort, $currentSearch);
+        // 'alpha' is not a valid Gitea API sort — fetch by 'updated' then sort PHP-side
+        $apiSort  = ($currentSort === 'alpha') ? 'updated' : $currentSort;
+        $allRepos = $api->fetchAllRepos($apiSort, $currentSearch);
+        if ($currentSort === 'alpha') {
+            usort($allRepos, fn($a, $b) => strcasecmp($a['full_name'] ?? '', $b['full_name'] ?? ''));
+        }
         $pageData['all_repos']   = $allRepos;                          // full list for stats
         $pageData['total_repos'] = count($allRepos);
         // PHP-side pagination: slice the full list for dashboard recent list
@@ -1153,6 +1162,14 @@ switch ($page) {
             $dlUrl  = urldecode($_GET['url']      ?? '');
             $dlFile = urldecode($_GET['filename'] ?? 'download');
             if ($dlUrl) {
+                // SSRF guard: only allow downloads from the configured Gitea host
+                $allowedHost = parse_url($giteaUrl, PHP_URL_HOST);
+                $dlHost      = parse_url($dlUrl,    PHP_URL_HOST);
+                if (!$allowedHost || !$dlHost || strtolower($dlHost) !== strtolower($allowedHost)) {
+                    http_response_code(403);
+                    echo json_encode(['error' => 'Download URL host tidak diizinkan']);
+                    exit;
+                }
                 $api->proxyDownload($dlUrl, $dlFile);
                 exit;
             }
@@ -1226,6 +1243,8 @@ switch ($page) {
     case 'sse':
         // Long-polling SSE for real-time activity feed
         // Usage: new EventSource('?page=sse&type=activity')
+        set_time_limit(0);        // prevent PHP from killing the stream at 30s default
+        ignore_user_abort(true);  // keep sending even if client disconnects (detect via connection_aborted)
         $sseType = $_GET['type'] ?? 'activity';
         header('Content-Type: text/event-stream; charset=utf-8');
         header('Cache-Control: no-cache');
@@ -2519,7 +2538,7 @@ endif; // end login page
                 <span class="nav-icon"><i class="fas fa-home"></i></span>
                 Dashboard
             </a>
-            <a href="?page=repos" class="nav-item <?= in_array($page,['repos','repo'])?'active':'' ?>">
+            <a href="?page=repos" class="nav-item <?= in_array($page,['repos','repo','file'])?'active':'' ?>">
                 <span class="nav-icon"><i class="fas fa-code-branch"></i></span>
                 Repositories
                 <span class="nav-badge"><?= $pageData['total_repos'] ?? '…' ?></span>
@@ -2600,7 +2619,7 @@ endif; // end login page
     <a href="?page=dashboard" class="bottom-nav-item <?= $page==='dashboard'?'active':'' ?>">
         <i class="fas fa-home"></i><span>Home</span>
     </a>
-    <a href="?page=repos" class="bottom-nav-item <?= in_array($page,['repos','repo'])?'active':'' ?>">
+    <a href="?page=repos" class="bottom-nav-item <?= in_array($page,['repos','repo','file'])?'active':'' ?>">
         <i class="fas fa-code-branch"></i><span>Repos</span>
     </a>
     <a href="?page=activity" class="bottom-nav-item <?= $page==='activity'?'active':'' ?>" style="position:relative;">
@@ -2790,7 +2809,7 @@ endif; // end login page
                     </div>
                     <div class="card-body">
                         <?php
-                        $totalLangCount = array_sum($topLangs);
+                        $totalLangCount = max(1, array_sum($topLangs));
                         ?>
                         <!-- Stacked language bar -->
                         <div class="lang-bar" style="margin-bottom:14px;">
@@ -3538,7 +3557,7 @@ endif; // end login page
                 </div>
                 <div class="card-body">
                     <?php
-                    $totalBytes = array_sum($languages);
+                    $totalBytes = max(1, array_sum($languages));
                     ?>
                     <div class="lang-bar" style="margin-bottom:14px;height:10px;">
                         <?php foreach ($languages as $lang => $bytes):
@@ -4297,13 +4316,14 @@ endif; // end login page
         $fSha     = $fInfo['sha'] ?? '';
         $fSizeFmt = isset($fInfo['size']) ? ($fInfo['size']>=1024 ? round($fInfo['size']/1024,1).' KB' : $fInfo['size'].' B') : '';
         $fEncoding= $fInfo['encoding'] ?? '';
+        // $ext and $isImage MUST be defined before $isBinary which depends on them
+        $ext      = strtolower(pathinfo($fPath, PATHINFO_EXTENSION));
+        $isImage  = in_array($ext, ['png','jpg','jpeg','gif','svg','webp','ico','bmp']);
         $isBinary = ($fEncoding === 'base64') && !$isImage && preg_match('/\x00/', $fContent ?? '');
         // Large files: Gitea returns null content — treat as binary to show download prompt
         if (!$isImage && !empty($fInfo['size']) && $fInfo['size'] > 1048576 && $fContent === '') {
             $isBinary = true;
         }
-        $ext      = strtolower(pathinfo($fPath, PATHINFO_EXTENSION));
-        $isImage  = in_array($ext, ['png','jpg','jpeg','gif','svg','webp','ico','bmp']);
         $isText   = !$isBinary && !$isImage;
         $repoBack = '?page=repo&owner='.urlencode($fOwner).'&repo='.urlencode($fRepo).'&ref='.urlencode($fRef).'&path='.urlencode($fDir);
 
