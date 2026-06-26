@@ -101,7 +101,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         if (is_dir($cacheDir)) {
             foreach (glob("$cacheDir/*.json") ?: [] as $f) @unlink($f);
         }
-        header('Location: ' . $_SERVER['PHP_SELF'] . '?page=settings&msg=cache_cleared');
+        // Redirect back to the page that triggered the action (dashboard or settings)
+        $refPage = $_POST['ref_page'] ?? $_GET['ref_page'] ?? 'dashboard';
+        $safePage = in_array($refPage, ['dashboard','settings']) ? $refPage : 'dashboard';
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?page=' . $safePage . '&msg=cache_cleared');
         exit;
     }
 }
@@ -689,7 +692,10 @@ class GiteaAPI {
 
     // ── get activities/feeds ─────────────────────────────────────────
     public function getUserFeeds(string $username, int $limit = 30): array|null {
-        return $this->request("/users/{$username}/heatmap", []);
+        // Correct endpoint: /users/{username}/heatmap returns contribution heatmap only,
+        // not activity feeds. Use /repos/{username}/... or admin feeds API instead.
+        // This returns the Gitea user feeds via the feeds endpoint.
+        return $this->request("/repos/search", ['limit' => $limit, 'owner' => $username, 'sort' => 'updated']);
     }
 
     public function getNotifications(int $limit = 20): array|null {
@@ -1233,6 +1239,16 @@ switch ($page) {
         if ($action === 'notifications') {
             $notifs = $api->getNotifications(20);
             echo json_encode($notifs ?: []);
+            exit;
+        }
+        // Reveal token — only available to authenticated session, never cached
+        if ($action === 'reveal_token') {
+            if (!isset($_SESSION['gitea_token'])) {
+                http_response_code(401);
+                echo json_encode(['error' => 'Unauthorized']);
+            } else {
+                echo json_encode(['token' => $_SESSION['gitea_token']]);
+            }
             exit;
         }
         http_response_code(400);
@@ -2855,6 +2871,7 @@ endif; // end login page
                         </a>
                         <form method="POST" style="margin:0;">
                             <input type="hidden" name="action" value="clear_cache">
+                            <input type="hidden" name="ref_page" value="dashboard">
                             <button type="submit" class="btn btn-ghost" style="width:100%;justify-content:center;">
                                 <i class="fas fa-broom"></i> Clear Cache
                             </button>
@@ -4267,6 +4284,7 @@ endif; // end login page
                     </div>
                     <form method="POST" style="margin:0;">
                         <input type="hidden" name="action" value="clear_cache">
+                        <input type="hidden" name="ref_page" value="settings">
                         <button type="submit" class="btn btn-danger">
                             <i class="fas fa-broom"></i> Bersihkan Cache
                         </button>
@@ -4701,7 +4719,7 @@ endif; // end login page
         </div>
 
         <!-- Notification banner -->
-        <div id="activityNotice" style="display:none;background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.35);border-radius:var(--radius);padding:8px 14px;margin-bottom:14px;font-size:13px;color:var(--green);display:flex;align-items:center;gap:8px;">
+        <div id="activityNotice" style="display:none;background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.35);border-radius:var(--radius);padding:8px 14px;margin-bottom:14px;font-size:13px;color:var(--green);align-items:center;gap:8px;">
             <i class="fas fa-circle-check"></i>
             <span id="activityNoticeText">Connected to live stream.</span>
             <button onclick="this.parentElement.style.display='none'" style="margin-left:auto;background:none;border:none;color:var(--text-muted);cursor:pointer;padding:0;font-size:14px;">✕</button>
@@ -4715,7 +4733,7 @@ endif; // end login page
             <div class="card" style="padding:0;overflow:hidden;">
                 <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;">
                     <span><i class="fas fa-list-ul" style="color:var(--blue);margin-right:8px;"></i>Recent Events
-                        <span id="eventCount" style="font-size:12px;font-weight:400;color:var(--text-muted);margin-left:6px;"><?= count($events) ?> loaded</span>
+                        <span id="eventCount" style="font-size:12px;font-weight:400;color:var(--text-muted);margin-left:6px;"><?= count($events) ?> events</span>
                     </span>
                     <div style="display:flex;gap:6px;align-items:center;">
                         <span id="lastUpdated" style="font-size:11px;color:var(--text-muted);"></span>
@@ -4891,7 +4909,7 @@ endif; // end login page
         .act-sha { font-size: 11px; color: var(--purple); font-family: 'JetBrains Mono', monospace; text-decoration: none; margin-top: 3px; display: inline-block; }
         .act-sha:hover { text-decoration: underline; }
         .act-time { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
-        .filter-btn.active { background: var(--bg-tertiary) !important; border-color: var(--border-active) !important; color: var(--text-primary) !important; }
+        .filter-btn.active { background: var(--bg-tertiary) !important; border-color: var(--border-color) !important; color: var(--text-primary) !important; }
         @media (max-width:768px) {
             [style*="grid-template-columns:1fr 280px"] { grid-template-columns: 1fr !important; }
         }
@@ -4934,19 +4952,44 @@ function copyText(elementId, btn) {
 
 /* ── Reveal token in settings ────────────────────────────── */
 let tokenRevealed = false;
-const REAL_TOKEN = <?= json_encode($giteaToken) ?>;
+let _cachedToken  = null;   // never embedded in HTML
 function revealToken(btn) {
     const el = document.getElementById('token-preview');
-    tokenRevealed = !tokenRevealed;
     if (tokenRevealed) {
-        el.textContent = REAL_TOKEN;
-        btn.innerHTML = '<i class="fas fa-eye-slash"></i> Hide';
-        btn.classList.add('copied');
-    } else {
-        el.textContent = '•'.repeat(20) + REAL_TOKEN.slice(-6);
-        btn.innerHTML = '<i class="fas fa-eye"></i> Show';
+        // Hide: replace with masked version using cached suffix
+        tokenRevealed = false;
+        el.textContent = '\u2022'.repeat(20) + (_cachedToken ? _cachedToken.slice(-6) : '??????');
+        btn.innerHTML  = '<i class="fas fa-eye"></i> Lihat';
         btn.classList.remove('copied');
+        return;
     }
+    // Reveal: fetch token from server (never embedded in page HTML)
+    if (_cachedToken) {
+        tokenRevealed = true;
+        el.textContent = _cachedToken;
+        btn.innerHTML  = '<i class="fas fa-eye-slash"></i> Hide';
+        btn.classList.add('copied');
+        return;
+    }
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-circle-notch fa-spin"></i>';
+    fetch('?page=api&action=reveal_token')
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(d) {
+            if (d && d.token) {
+                _cachedToken   = d.token;
+                tokenRevealed  = true;
+                el.textContent = _cachedToken;
+                btn.innerHTML  = '<i class="fas fa-eye-slash"></i> Hide';
+                btn.classList.add('copied');
+            } else {
+                btn.innerHTML = '<i class="fas fa-eye"></i> Lihat';
+            }
+        })
+        .catch(function(){
+            btn.innerHTML = '<i class="fas fa-eye"></i> Lihat';
+        })
+        .finally(function(){ btn.disabled = false; });
 }
 
 /* ── Auto-dismiss alerts ─────────────────────────────────── */
@@ -5302,7 +5345,7 @@ var RT = {
             ? '<i class="fas fa-tag"></i>'
             : '<i class="fas fa-code-commit"></i>';
 
-        var typeClass = 'act-' + (ev.type || 'push');
+        var typeClass = 'act-' + RT.esc(ev.type || 'push');
 
         var verbLine = '';
         if (ev.type === 'release') {
@@ -5321,7 +5364,7 @@ var RT = {
             var msgShort = ev.message.length > 120 ? ev.message.substring(0,120) + '…' : ev.message;
             msgHtml = '<div class="act-message">' + RT.esc(msgShort) + '</div>';
             if (ev.sha) {
-                msgHtml += '<a href="' + RT.esc(ev.url || '#') + '" target="_blank" class="act-sha">' + ev.sha.substring(0,7) + '</a>';
+                msgHtml += '<a href="' + RT.esc(ev.url || '#') + '" target="_blank" class="act-sha">' + RT.esc(ev.sha.substring(0,7)) + '</a>';
             }
         }
 
@@ -5464,25 +5507,26 @@ function applyActivityFilter(type, search, clickedBtn) {
 
     // Update active state on sidebar filter buttons
     document.querySelectorAll('.filter-btn').forEach(function(b){
-        b.classList.toggle('active', (b.getAttribute('data-ftype') || '') === filterType);
-        b.className = b.className.replace(/\bbtn-secondary\b/g, 'btn-ghost').replace(/\bbtn-ghost\b/g, 'btn-ghost');
-        if ((b.getAttribute('data-ftype') || '') === filterType) {
-            b.className = b.className.replace('btn-ghost', 'btn-secondary');
+        var isActive = (b.getAttribute('data-ftype') || '') === filterType;
+        b.classList.toggle('active', isActive);
+        // Reset to ghost, then promote active one to secondary
+        b.className = b.className.replace(/\bbtn-secondary\b/g, 'btn-ghost');
+        if (isActive) {
+            b.className = b.className.replace(/\bbtn-ghost\b/, 'btn-secondary');
         }
     });
 }
 
-// Auto-init if already on activity page (SSR render case)
+// Stats polling is always started from initActivityPage() / RT.init().
+// For non-activity pages we need stats polling too (live counters in sidebar).
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function(){ if(document.getElementById('activityFeed')) RT.init(); });
+    document.addEventListener('DOMContentLoaded', function(){
+        // Activity page: RT.init() handles everything (SSE + polls + stats)
+        // Other pages: start stats polling only
+        if (!document.getElementById('activityFeed') && !RT.statsTimer) RT.startStatsPolling();
+    });
 } else {
-    if (document.getElementById('activityFeed')) RT.init();
-}
-// Also always start stats polling globally (for dashboard counters)
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function(){ if(!RT.statsTimer) RT.startStatsPolling(); });
-} else {
-    if (!RT.statsTimer) RT.startStatsPolling();
+    if (!document.getElementById('activityFeed') && !RT.statsTimer) RT.startStatsPolling();
 }
 </script>
 
