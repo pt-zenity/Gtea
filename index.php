@@ -13,7 +13,9 @@ define('GITEA_API_BASE', GITEA_BASE_URL . '/api/v1');
 define('APP_NAME', 'Gitea Manager');
 define('APP_DOMAIN', 'git.sis1.dev');
 define('APP_VERSION', '5.0');
-define('CACHE_DURATION', 300); // 5 minutes
+define('CACHE_DURATION', 300);       // 5 minutes (default)
+define('CACHE_DURATION_SHORT', 60);  // 1 minute (version / user)
+define('CACHE_DURATION_LONG', 900);  // 15 minutes (repo list)
 define('PER_PAGE', 20);
 
 // ============================================================
@@ -140,6 +142,9 @@ class GiteaAPI {
     private string $token;
     private string $cacheDir;
 
+    /** In-request memoization: endpoint => data */
+    private array $memo = [];
+
     public function __construct(string $baseUrl, string $token = '') {
         $this->baseUrl  = rtrim($baseUrl, '/') . '/api/v1';
         $this->token    = $token;
@@ -168,43 +173,121 @@ class GiteaAPI {
         return $this->cacheDir . '/' . $tokenHash . '_' . md5($url) . '.json';
     }
 
-    private function request(string $endpoint, array $params = [], bool $useCache = true): array|null {
+    /**
+     * Build a configured cURL handle (does NOT exec).
+     * Shared by request(), requestWithHeaders(), and requestParallel().
+     */
+    private function buildCurlHandle(string $url): \CurlHandle {
+        $ch      = curl_init();
+        $headers = ['Accept: application/json'];
+        if ($this->token) $headers[] = 'Authorization: token ' . $this->token;
+        curl_setopt_array($ch, [
+            CURLOPT_URL               => $url,
+            CURLOPT_RETURNTRANSFER    => true,
+            CURLOPT_HTTPHEADER        => $headers,
+            CURLOPT_TIMEOUT           => 8,   // ↓ was 20 — fail fast
+            CURLOPT_CONNECTTIMEOUT    => 3,   // ↓ was 8
+            CURLOPT_SSL_VERIFYPEER    => false,
+            CURLOPT_SSL_VERIFYHOST    => false,
+            CURLOPT_FOLLOWLOCATION    => true,
+            CURLOPT_MAXREDIRS         => 3,
+            CURLOPT_UNRESTRICTED_AUTH => true,
+            CURLOPT_USERAGENT         => 'GiteaManager/3.0',
+            CURLOPT_ENCODING          => '', // accept gzip/deflate
+        ]);
+        return $ch;
+    }
+
+    /**
+     * Execute multiple API endpoints IN PARALLEL via curl_multi_exec.
+     * Returns assoc array keyed by the same keys as $endpoints.
+     *
+     * @param array<string,string>  $endpoints  key => full URL
+     * @param array<string,mixed>   $cache      key => cached data (skip those)
+     * @param int                   $ttl        cache TTL in seconds
+     * @return array<string,array|null>
+     */
+    public function requestParallel(array $endpoints, int $ttl = CACHE_DURATION): array {
+        $results  = [];
+        $handles  = [];
+        $mh       = curl_multi_init();
+
+        foreach ($endpoints as $key => $url) {
+            // Serve from memo first
+            if (isset($this->memo[$url])) {
+                $results[$key] = $this->memo[$url];
+                continue;
+            }
+            // Serve from file cache
+            $cf = $this->getCacheKey($url);
+            if (file_exists($cf) && (time() - filemtime($cf) < $ttl)) {
+                $cached = json_decode(file_get_contents($cf), true);
+                if ($cached !== null) {
+                    $results[$key]     = $cached;
+                    $this->memo[$url]  = $cached;
+                    continue;
+                }
+            }
+            // Need to fetch
+            $ch          = $this->buildCurlHandle($url);
+            $handles[$key] = ['ch' => $ch, 'url' => $url, 'cf' => $cf];
+            curl_multi_add_handle($mh, $ch);
+        }
+
+        // Execute all pending handles in parallel
+        if (!empty($handles)) {
+            $active = null;
+            do {
+                $status = curl_multi_exec($mh, $active);
+                if ($active) curl_multi_select($mh, 0.1);
+            } while ($active && $status === CURLM_OK);
+
+            foreach ($handles as $key => $info) {
+                $response  = curl_multi_getcontent($info['ch']);
+                $httpCode  = curl_getinfo($info['ch'], CURLINFO_HTTP_CODE);
+                $curlError = curl_error($info['ch']);
+                curl_multi_remove_handle($mh, $info['ch']);
+                curl_close($info['ch']);
+
+                if ($curlError || $httpCode < 200 || $httpCode >= 300 || !$response) {
+                    $results[$key] = null;
+                    continue;
+                }
+                $data = json_decode($response, true);
+                $results[$key]          = $data;
+                $this->memo[$info['url']] = $data;
+                if ($data !== null) {
+                    file_put_contents($info['cf'], $response, LOCK_EX);
+                }
+            }
+        }
+        curl_multi_close($mh);
+        return $results;
+    }
+
+    private function request(string $endpoint, array $params = [], bool $useCache = true, int $ttl = CACHE_DURATION): array|null {
         $url = $this->baseUrl . $endpoint;
         if (!empty($params)) $url .= '?' . http_build_query($params);
+
+        // In-request memo (fastest — avoids even file I/O)
+        if (isset($this->memo[$url])) return $this->memo[$url];
 
         $cacheFile = $this->getCacheKey($url);
 
         // Serve from cache if fresh
         if ($useCache && file_exists($cacheFile)) {
             $age = time() - filemtime($cacheFile);
-            if ($age < CACHE_DURATION) {
+            if ($age < $ttl) {
                 $cached = json_decode(file_get_contents($cacheFile), true);
-                if ($cached !== null) return $cached;
+                if ($cached !== null) {
+                    $this->memo[$url] = $cached;
+                    return $cached;
+                }
             }
         }
 
-        // Make HTTP request
-        $ch      = curl_init();
-        $headers = ['Accept: application/json'];
-        if ($this->token) {
-            $headers[] = 'Authorization: token ' . $this->token;
-        }
-
-        curl_setopt_array($ch, [
-            CURLOPT_URL             => $url,
-            CURLOPT_RETURNTRANSFER  => true,
-            CURLOPT_HTTPHEADER      => $headers,
-            CURLOPT_TIMEOUT         => 20,
-            CURLOPT_CONNECTTIMEOUT  => 8,
-            CURLOPT_SSL_VERIFYPEER  => false,
-            CURLOPT_SSL_VERIFYHOST  => false,
-            CURLOPT_FOLLOWLOCATION  => true,
-            CURLOPT_MAXREDIRS       => 3,
-            // Keep Authorization header through redirects
-            CURLOPT_UNRESTRICTED_AUTH => true,
-            CURLOPT_USERAGENT       => 'GiteaManager/3.0',
-            CURLOPT_ENCODING        => '',   // Accept gzip/deflate
-        ]);
+        // Make HTTP request using shared handle builder
+        $ch = $this->buildCurlHandle($url);
 
         $response  = curl_exec($ch);
         $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -217,22 +300,25 @@ class GiteaAPI {
         }
 
         $data = json_decode($response, true);
-        if ($data !== null && $useCache) {
-            file_put_contents($cacheFile, $response, LOCK_EX);
+        if ($data !== null) {
+            $this->memo[$url] = $data;
+            if ($useCache) file_put_contents($cacheFile, $response, LOCK_EX);
         }
         return $data;
     }
 
     public function getVersion(): array|null {
-        return $this->request('/version', [], false);
+        // Cache version for 60 s — it almost never changes
+        return $this->request('/version', [], true, CACHE_DURATION_SHORT);
     }
 
     public function getCurrentUser(): array|null {
-        return $this->request('/user', [], false);
+        // Cache current user for 60 s to avoid API call on every page
+        return $this->request('/user', [], true, CACHE_DURATION_SHORT);
     }
 
     public function getNodeInfo(): array|null {
-        return $this->request('/settings/api', [], false);
+        return $this->request('/settings/api', [], true, CACHE_DURATION_SHORT);
     }
 
     // ── request with response headers capture ───────────────────────
@@ -240,32 +326,16 @@ class GiteaAPI {
         $url = $this->baseUrl . $endpoint;
         if (!empty($params)) $url .= '?' . http_build_query($params);
 
-        $ch      = curl_init();
-        $headers = ['Accept: application/json'];
-        if ($this->token) $headers[] = 'Authorization: token ' . $this->token;
+        $ch = $this->buildCurlHandle($url);
 
         $responseHeaders = [];
-        curl_setopt_array($ch, [
-            CURLOPT_URL             => $url,
-            CURLOPT_RETURNTRANSFER  => true,
-            CURLOPT_HTTPHEADER      => $headers,
-            CURLOPT_TIMEOUT         => 20,
-            CURLOPT_CONNECTTIMEOUT  => 8,
-            CURLOPT_SSL_VERIFYPEER  => false,
-            CURLOPT_SSL_VERIFYHOST  => false,
-            CURLOPT_FOLLOWLOCATION  => true,
-            CURLOPT_MAXREDIRS       => 3,
-            CURLOPT_UNRESTRICTED_AUTH => true,
-            CURLOPT_USERAGENT       => 'GiteaManager/3.0',
-            CURLOPT_ENCODING        => '',
-            CURLOPT_HEADERFUNCTION  => function($ch, $header) use (&$responseHeaders) {
-                $parts = explode(':', $header, 2);
-                if (count($parts) === 2) {
-                    $responseHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
-                }
-                return strlen($header);
-            },
-        ]);
+        curl_setopt($ch, CURLOPT_HEADERFUNCTION, function($ch, $header) use (&$responseHeaders) {
+            $parts = explode(':', $header, 2);
+            if (count($parts) === 2) {
+                $responseHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
+            }
+            return strlen($header);
+        });
 
         $response  = curl_exec($ch);
         $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -275,7 +345,7 @@ class GiteaAPI {
         if ($curlError || $httpCode < 200 || $httpCode >= 300) {
             return ['data' => null, 'headers' => [], 'total' => 0];
         }
-        $data = json_decode($response, true);
+        $data  = json_decode($response, true);
         $total = (int)($responseHeaders['x-total-count'] ?? 0);
         return ['data' => $data, 'headers' => $responseHeaders, 'total' => $total];
     }
@@ -290,31 +360,70 @@ class GiteaAPI {
 
     // ── fetch ALL repos (all pages) ──────────────────────────────────
     public function fetchAllRepos(string $sort = 'updated', string $q = ''): array {
-        $cacheKey  = $this->getCacheKey('fetchAllRepos_' . $sort . '_' . $q);
-        if (file_exists($cacheKey) && (time() - filemtime($cacheKey) < CACHE_DURATION)) {
+        // In-request memo — getLiveStats() & other callers share same result within one request
+        $memoKey = 'fetchAllRepos_' . $sort . '_' . $q;
+        if (isset($this->memo[$memoKey])) return $this->memo[$memoKey];
+
+        $cacheKey = $this->getCacheKey($memoKey);
+        if (file_exists($cacheKey) && (time() - filemtime($cacheKey) < CACHE_DURATION_LONG)) {
             $cached = json_decode(file_get_contents($cacheKey), true);
-            if ($cached !== null) return $cached;
+            if ($cached !== null) {
+                $this->memo[$memoKey] = $cached;
+                return $cached;
+            }
         }
 
-        $allRepos = [];
-        $page     = 1;
-        $limit    = 50;
+        // Fetch first page to discover total count
+        $limit   = 50;
+        $params0 = ['limit' => $limit, 'page' => 1, 'sort' => $sort, 'order' => 'desc'];
+        if ($q) $params0['q'] = $q;
+        $first = $this->requestWithHeaders('/repos/search', $params0);
+        $page1Data = $first['data']['data'] ?? [];
+        if (empty($page1Data)) {
+            $this->memo[$memoKey] = [];
+            return [];
+        }
 
-        while (true) {
-            $params = ['limit' => $limit, 'page' => $page, 'sort' => $sort, 'order' => 'desc'];
+        $allRepos = $page1Data;
+
+        // If first page is already complete, no more pages needed
+        if (count($page1Data) < $limit) {
+            if (!empty($allRepos)) file_put_contents($cacheKey, json_encode($allRepos), LOCK_EX);
+            $this->memo[$memoKey] = $allRepos;
+            return $allRepos;
+        }
+
+        // Discover how many pages we need from X-Total-Count header
+        $total      = (int)($first['headers']['x-total-count'] ?? 0);
+        $totalPages = $total > 0 ? (int)ceil($total / $limit) : 20;
+        $totalPages = min($totalPages, 20); // safety cap
+
+        if ($totalPages <= 1) {
+            if (!empty($allRepos)) file_put_contents($cacheKey, json_encode($allRepos), LOCK_EX);
+            $this->memo[$memoKey] = $allRepos;
+            return $allRepos;
+        }
+
+        // Fetch remaining pages IN PARALLEL
+        $endpoints = [];
+        for ($p = 2; $p <= $totalPages; $p++) {
+            $params = ['limit' => $limit, 'page' => $p, 'sort' => $sort, 'order' => 'desc'];
             if ($q) $params['q'] = $q;
-            $result = $this->requestWithHeaders('/repos/search', $params);
-            $data   = $result['data']['data'] ?? [];
-            if (empty($data)) break;
-            $allRepos = array_merge($allRepos, $data);
-            if (count($data) < $limit) break;
-            $page++;
-            if ($page > 20) break; // safety cap
+            $endpoints['page_' . $p] = $this->baseUrl . '/repos/search?' . http_build_query($params);
+        }
+        $parallelResults = $this->requestParallel($endpoints, CACHE_DURATION_LONG);
+        foreach ($parallelResults as $res) {
+            if (is_array($res)) {
+                // requestWithHeaders wraps in ['data'=>['data'=>[...]]]; parallel returns raw JSON
+                $rows = $res['data'] ?? $res;
+                if (is_array($rows) && isset($rows[0])) $allRepos = array_merge($allRepos, $rows);
+            }
         }
 
         if (!empty($allRepos)) {
             file_put_contents($cacheKey, json_encode($allRepos), LOCK_EX);
         }
+        $this->memo[$memoKey] = $allRepos;
         return $allRepos;
     }
 
@@ -536,7 +645,8 @@ class GiteaAPI {
             CURLOPT_URL            => $url,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER     => $hdrs,
-            CURLOPT_TIMEOUT        => 20,
+            CURLOPT_TIMEOUT        => 8,
+            CURLOPT_CONNECTTIMEOUT => 3,
             CURLOPT_SSL_VERIFYPEER => false,
             CURLOPT_SSL_VERIFYHOST => false,
             CURLOPT_FOLLOWLOCATION => true,
@@ -582,25 +692,37 @@ class GiteaAPI {
         ];
     }
 
-    // ── enrich tree items with commit message (batch, max N items) ───
+    // ── enrich tree items with commit message (PARALLEL batch, max N items) ───
     public function enrichTreeWithCommits(string $owner, string $repo, array $tree, string $ref = '', int $max = 25): array {
-        $count = 0;
-        foreach ($tree as &$item) {
-            // last_committer_date already present from contents API
-            // Only fetch commit message if not already there (it never is from contents API)
-            if ($count >= $max) break;
+        $items = array_slice($tree, 0, $max);
+
+        // Build parallel endpoint map
+        $endpoints = [];
+        foreach ($items as $idx => $item) {
             $path   = $item['path'] ?? '';
-            $commit = $this->getLastCommit($owner, $repo, $path, $ref);
-            if ($commit) {
-                $item['_commit_message'] = $commit['message'];
-                $item['_commit_sha']     = substr($commit['sha'], 0, 7);
-                $item['_commit_url']     = $commit['url'];
-                $item['_commit_author']  = $commit['author'];
-            }
-            $count++;
+            $params = ['limit' => 1];
+            if ($path !== '') $params['path'] = $path;
+            if ($ref  !== '') $params['sha']  = $ref;
+            $endpoints[$idx] = $this->baseUrl . "/repos/{$owner}/{$repo}/commits?" . http_build_query($params);
+        }
+
+        $results = $this->requestParallel($endpoints);
+
+        foreach ($items as $idx => &$item) {
+            $res = $results[$idx] ?? null;
+            if (!is_array($res) || empty($res) || isset($res['message'])) continue;
+            $c = $res[0] ?? null;
+            if (!$c) continue;
+            $item['_commit_message'] = strtok($c['commit']['message'] ?? '', "\n");
+            $item['_commit_sha']     = substr($c['sha'] ?? '', 0, 7);
+            $item['_commit_url']     = $c['html_url'] ?? '';
+            $item['_commit_author']  = $c['commit']['author']['name'] ?? '';
         }
         unset($item);
-        return $tree;
+
+        // Merge back items beyond $max (no commit info)
+        $rest = array_slice($tree, $max);
+        return array_merge($items, $rest);
     }
 
     // ── get single file info + content (base64 encoded) ─────────────
@@ -676,7 +798,8 @@ class GiteaAPI {
             CURLOPT_CUSTOMREQUEST  => $method,
             CURLOPT_POSTFIELDS     => $body,
             CURLOPT_HTTPHEADER     => $hdrs,
-            CURLOPT_TIMEOUT        => 20,
+            CURLOPT_TIMEOUT        => 15,  // write ops can be slightly slower
+            CURLOPT_CONNECTTIMEOUT => 3,
             CURLOPT_SSL_VERIFYPEER => false,
             CURLOPT_SSL_VERIFYHOST => false,
             CURLOPT_USERAGENT      => 'GiteaManager/3.0',
@@ -706,18 +829,37 @@ class GiteaAPI {
         return $this->request("/repos/{$owner}/{$repo}/commits", ['limit' => $limit]);
     }
 
-    // ── global event feed (recent activity across all repos) ─────────
+    // ── global event feed (recent activity across all repos — PARALLEL) ─────
     public function getGlobalActivity(int $limit = 30): array {
-        // Use recent commits from top repos as "activity events"
-        $events   = [];
-        $allRepos = $this->fetchAllRepos('updated');
-        $topRepos = array_slice($allRepos, 0, 8); // scan top 8 recently updated
-        foreach ($topRepos as $r) {
+        $allRepos   = $this->fetchAllRepos('updated');
+        $topCommit  = array_slice($allRepos, 0, 8);
+        $topRelease = array_slice($allRepos, 0, 5);
+
+        // Build parallel endpoint map for commits + releases at once
+        $endpoints = [];
+        foreach ($topCommit as $idx => $r) {
             $owner = $r['owner']['login'] ?? '';
-            $name  = $r['name'] ?? '';
+            $name  = $r['name']          ?? '';
             if (!$owner || !$name) continue;
-            $commits = $this->request("/repos/{$owner}/{$name}/commits", ['limit' => 5], false);
+            $endpoints['commit_' . $idx] = $this->baseUrl
+                . "/repos/{$owner}/{$name}/commits?" . http_build_query(['limit' => 5]);
+        }
+        foreach ($topRelease as $idx => $r) {
+            $owner = $r['owner']['login'] ?? '';
+            $name  = $r['name']          ?? '';
+            if (!$owner || !$name) continue;
+            $endpoints['release_' . $idx] = $this->baseUrl
+                . "/repos/{$owner}/{$name}/releases?" . http_build_query(['limit' => 2]);
+        }
+
+        $fetched = $this->requestParallel($endpoints);
+        $events  = [];
+
+        foreach ($topCommit as $idx => $r) {
+            $commits = $fetched['commit_' . $idx] ?? null;
             if (!is_array($commits)) continue;
+            $owner = $r['owner']['login'] ?? '';
+            $name  = $r['name']          ?? '';
             foreach ($commits as $c) {
                 $events[] = [
                     'type'       => 'push',
@@ -736,15 +878,12 @@ class GiteaAPI {
                     'private'    => $r['private'] ?? false,
                 ];
             }
-            if (count($events) >= $limit) break;
         }
-        // Also add recent release events
-        foreach (array_slice($allRepos, 0, 5) as $r) {
-            $owner = $r['owner']['login'] ?? '';
-            $name  = $r['name'] ?? '';
-            if (!$owner || !$name) continue;
-            $releases = $this->request("/repos/{$owner}/{$name}/releases", ['limit' => 2], false);
+        foreach ($topRelease as $idx => $r) {
+            $releases = $fetched['release_' . $idx] ?? null;
             if (!is_array($releases)) continue;
+            $owner = $r['owner']['login'] ?? '';
+            $name  = $r['name']          ?? '';
             foreach ($releases as $rel) {
                 $events[] = [
                     'type'       => 'release',
@@ -764,7 +903,7 @@ class GiteaAPI {
                 ];
             }
         }
-        // Sort by date desc
+
         usort($events, fn($a,$b) => strtotime($b['created_at']??'0') - strtotime($a['created_at']??'0'));
         return array_slice($events, 0, $limit);
     }
@@ -930,15 +1069,27 @@ switch ($page) {
             $pageData['repo'] = $repoData;
 
             if ($repoData) {
-                // Parallel fetch sub-resources; skip if repo is empty
+                // Parallel fetch all sub-resources in ONE round-trip
                 $isEmpty = $repoData['empty'] ?? false;
-                $pageData['branches']  = $isEmpty ? [] : ($api->getBranches($owner, $repo) ?? []);
-                $pageData['releases']  = $api->getReleases($owner, $repo) ?? [];
-                $pageData['issues']    = $isEmpty ? [] : ($api->getIssues($owner, $repo, 'open') ?? []);
-                $pageData['commits']   = $isEmpty ? [] : ($api->getCommits($owner, $repo, 5) ?? []);
-                $pageData['languages'] = $isEmpty ? [] : ($api->getRepoLanguages($owner, $repo) ?? []);
-                $pageData['topics']    = $api->getRepoTopics($owner, $repo) ?? [];
-                $pageData['tags']      = $api->getTags($owner, $repo) ?? [];
+                $sub = [];
+                if (!$isEmpty) {
+                    $sub['branches']  = $api->getBaseUrl() . "/repos/{$owner}/{$repo}/branches?" . http_build_query(['limit' => 50]);
+                    $sub['issues']    = $api->getBaseUrl() . "/repos/{$owner}/{$repo}/issues?"   . http_build_query(['state' => 'open', 'type' => 'issues', 'limit' => 10]);
+                    $sub['commits']   = $api->getBaseUrl() . "/repos/{$owner}/{$repo}/commits?"  . http_build_query(['limit' => 5]);
+                    $sub['languages'] = $api->getBaseUrl() . "/repos/{$owner}/{$repo}/languages";
+                }
+                $sub['releases'] = $api->getBaseUrl() . "/repos/{$owner}/{$repo}/releases?" . http_build_query(['limit' => 10]);
+                $sub['topics']   = $api->getBaseUrl() . "/repos/{$owner}/{$repo}/topics";
+                $sub['tags']     = $api->getBaseUrl() . "/repos/{$owner}/{$repo}/tags?"     . http_build_query(['limit' => 10]);
+
+                $subData = $api->requestParallel($sub);
+                $pageData['branches']  = $isEmpty ? [] : ($subData['branches']  ?? []);
+                $pageData['releases']  = $subData['releases']  ?? [];
+                $pageData['issues']    = $isEmpty ? [] : ($subData['issues']    ?? []);
+                $pageData['commits']   = $isEmpty ? [] : ($subData['commits']   ?? []);
+                $pageData['languages'] = $isEmpty ? [] : ($subData['languages'] ?? []);
+                $pageData['topics']    = $subData['topics'] ?? [];
+                $pageData['tags']      = $subData['tags']   ?? [];
                 // Root file tree (for file browser card)
                 $browseRef = trim($_GET['ref'] ?? '');
                 $browsePath = trim($_GET['path'] ?? '');
@@ -1249,6 +1400,45 @@ switch ($page) {
             } else {
                 echo json_encode(['token' => $_SESSION['gitea_token']]);
             }
+            exit;
+        }
+        // Lazy-load commit info for file-tree items (parallel batch)
+        // ?page=api&action=tree_commits&owner=X&repo=Y&ref=Z&paths[]=a&paths[]=b
+        if ($action === 'tree_commits') {
+            header('Cache-Control: public, max-age=120');
+            $tcOwner = trim($_GET['owner'] ?? '');
+            $tcRepo  = trim($_GET['repo']  ?? '');
+            $tcRef   = trim($_GET['ref']   ?? '');
+            $tcPaths = (array)($_GET['paths'] ?? []);
+            if (!$tcOwner || !$tcRepo || empty($tcPaths)) {
+                echo json_encode([]);
+                exit;
+            }
+            $tcPaths = array_slice($tcPaths, 0, 50); // max 50 paths at once
+            $endpoints = [];
+            foreach ($tcPaths as $i => $path) {
+                $params = ['limit' => 1];
+                if ($path !== '') $params['path'] = $path;
+                if ($tcRef !== '') $params['sha'] = $tcRef;
+                $endpoints[$i] = $api->getBaseUrl()
+                    . "/repos/{$tcOwner}/{$tcRepo}/commits?" . http_build_query($params);
+            }
+            $raw  = $api->requestParallel($endpoints);
+            $out  = [];
+            foreach ($tcPaths as $i => $path) {
+                $res = $raw[$i] ?? null;
+                if (!is_array($res) || empty($res) || isset($res['message'])) continue;
+                $c = $res[0] ?? null;
+                if (!$c) continue;
+                $out[$path] = [
+                    'message' => strtok($c['commit']['message'] ?? '', "\n"),
+                    'sha'     => substr($c['sha'] ?? '', 0, 7),
+                    'url'     => $c['html_url'] ?? '',
+                    'author'  => $c['commit']['author']['name'] ?? '',
+                    'date'    => $c['commit']['author']['date'] ?? '',
+                ];
+            }
+            echo json_encode($out);
             exit;
         }
         http_response_code(400);
